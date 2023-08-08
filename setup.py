@@ -20,7 +20,8 @@ setup(
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [
-            'sam_obstacle_node=sam_obstacle_node.sam_obstacle_node:main'
+            'sam_obstacle_node=sam_obstacle_node.sam_obstacle_node:main',
+            'sam_obstacle_node_ori=sam_obstacle_node.sam_obstacle_node_ori:main'
         ],
     },
 )
