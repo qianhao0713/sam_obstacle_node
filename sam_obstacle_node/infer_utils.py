@@ -7,6 +7,39 @@ from segment_anything_yhl.utils.transforms import ResizeLongestSide
 from segment_anything_yhl.utils.onnx import SamOnnxModel
 import cv2
 from torchvision.ops.boxes import batched_nms
+import random
+
+random_colors = [[random.randint(0,255) for _ in range(3)] for _ in range(100)]
+
+def show_lidar_result(img, coords, res, show_mask=False, video_writer=None):
+    import cv2, random, sys
+    cv2.namedWindow("test", 0)
+    cv2.resizeWindow("test", 1000, 600)
+    if coords is not None:
+        for i, coord in enumerate(coords):
+            color = [255,0,0]
+            # color = random_colors[i]
+            for pixel in coord:
+                pixel = pixel.astype('int32')
+                img = cv2.circle(img, pixel, 3, color, 3)
+    for i in range(len(res)):
+        color = random_colors[i]
+        bbox=[int(x) for x in res[i]['bbox']]
+        x, y, w, h = bbox
+        img = cv2.rectangle(img, [x, y], [x+w, y+h], color, 2)
+        if show_mask:
+            mask=res[i]['segmentation']
+            if mask is not None:
+                img[mask]=color
+    cv2.imshow("test", img)
+    if video_writer:
+        video_writer.write(img)
+    waitKey = cv2.waitKey(25)
+    if waitKey & 0xFF == ord('q'):
+        cv2.destroyAllWindows()
+        if video_writer:
+            video_writer.release()
+        sys.exit(0)
 
 def resample_coords(coords, max_point, n_resample):
     import random
