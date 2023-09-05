@@ -1,8 +1,4 @@
 import sys
-
-sys.path.append("/home/gywrc-s1/xfy/xufengyu_BasePerception_0720_sam/src/SAM_seg_head_node")
-sys.path.append("/home/gywrc-s1/xfy/xufengyu_BasePerception_0720_sam/src/msgs")
-
 import os
 
 import cv2
@@ -20,18 +16,17 @@ from rclpy.serialization import serialize_message
 
 import message_filters
 from cv_bridge import CvBridge
-from perception_msgs.msg import VitBoundingBoxes
+from perception_msgs.msg import VitImageEmbedding, BoundingBoxes
 from perception_msgs.msg import PointClusterVec
 from perception_msgs.msg import SamResults, OnePoint, OneBox
-
+from geometry_msgs.msg import PoseStamped
 from segment_anything.build_ros_model import build_ros_model
-# import pycuda.driver as drv
-# from pointcloud_cluster_cpp.lib import pointcloud_cluster
 from . import infer_utils
 from collections import deque
 from threading import Lock
 from rclpy.executors import MultiThreadedExecutor
-from rclpy.callback_groups import ReentrantCallbackGroup
+from rclpy.callback_groups import ReentrantCallbackGroup, MutuallyExclusiveCallbackGroup
+from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy
 import open3d as o3d
 import threading
 
@@ -52,6 +47,10 @@ class ModelSingleton():
         if not cls.__model:
             cls.__model = build_ros_model('mask_decoder', 0)
         return cls.__model
+
+    @classmethod
+    def release(cls):
+        cls.__model.model = None
 
 def cal_iou(box: np.ndarray, boxes: np.ndarray):
     """ 计算一个边界框和多个边界框的交并比
@@ -127,56 +126,61 @@ class SAMObstacleNode(Node):
         self.vw=None
         self.iou_thres = 0.6
         self.lidar_queue = deque()
-        self.max_queue_size = 50
-        img_callback_group = ReentrantCallbackGroup()
-        lidar_callback_group = ReentrantCallbackGroup()
+        self.max_queue_size = 20
+        self.yolo_queue = deque()
+        self.yolo_queue_size = 20
+        self.img_callback_group = MutuallyExclusiveCallbackGroup()
+        self.lidar_callback_group = MutuallyExclusiveCallbackGroup()
+        self.yolo_callback_group = MutuallyExclusiveCallbackGroup()
         # lidar_callback_group = None
-        self.img_subscription= self.create_subscription(VitBoundingBoxes, "/vit_bounding_boxes", self.callback, 1,  callback_group=img_callback_group)
-        self.lidar_subscription= self.create_subscription(PointClusterVec, "/sam_point_cluster", self.lidar_callback, 1, callback_group=lidar_callback_group)
+        self.qos_profile_img = QoSProfile(
+            reliability=QoSReliabilityPolicy.BEST_EFFORT,
+            history=QoSHistoryPolicy.KEEP_LAST,
+            depth=1
+        )
+        self.qos_profile = QoSProfile(
+            reliability=QoSReliabilityPolicy.BEST_EFFORT,
+            history=QoSHistoryPolicy.KEEP_LAST,
+            depth=1
+        )
+        self.img_subscription= self.create_subscription(VitImageEmbedding, "/Image_embedding", self.callback, self.qos_profile_img,  callback_group=self.img_callback_group, )
+        self.lidar_subscription= self.create_subscription(PointClusterVec, "/sam_point_cluster", self.lidar_callback, self.qos_profile, callback_group=self.lidar_callback_group)
+        self.yolo_subscription = self.create_subscription(BoundingBoxes, "/yolov8/bounding_boxes_mask", self.yolo_callback, self.qos_profile, callback_group=self.yolo_callback_group)
+        self.task_num = self.create_subscription(PoseStamped, 'task_num', self.task_callback, self.qos_profile)
         self.sam_obstacle_pub = self.create_publisher(SamResults, "/sam_obstacle", 1)
         self.hang = False
         self.warning_index = 0
-        self.lock = threading.Lock()
+        self.result_index = 0
+        self.saveimg = False
         print('init done')
         
         # self.lidar_queue_size = 30
 
-    async def callback(self, msg_emb):
-        if self.hang:
-            return
-        self.hang = True
+    def callback(self, msg_emb):
         image_embedding, check = self.mask_decoder_model.get_buffer(msg_emb.ipc_header, msg_emb.check_header)
-        self.get_logger().info('emb_msg received')
-        if int(msg_emb.header.stamp.nanosec) == check:
-            self.get_logger().info("ipc check success")
-        else:
+        if int(msg_emb.header.stamp.nanosec) != check:
             self.get_logger().info("ipc check failed")
             return
-        with self.lock:
-            while True:
-                if len(self.lidar_queue) == 0:
-                    self.get_logger().info('lidar_msg not received')
-                    self.warning_index += 1
-                    if self.warning_index >=10:
-                        raise Ros2MsgError("lidar_msg not received more than 10 times")
-                        # self.img_subscription= self.create_subscription(VitBoundingBoxes, "/vit_bounding_boxes", self.callback, 1,  callback_group=self.img_callback_group)
-                    self.hang = False
-                    return
-                msg_lidar = self.lidar_queue[0]
-                comp = compare_ts(msg_emb.header.stamp, msg_lidar.header.stamp)
-                comp = comp / 1e9
-                if abs(comp)<0.05:
-                    self.get_logger().info('found lidar_msg')
-                    break
-                elif comp < -0.05:
-                    self.get_logger().info('lidar_msg too late')
-                    self.hang = False
-                    return
-                else:
-                    self.lidar_queue.popleft()
-            if msg_lidar.size == 0:
-                self.hang = False
+        while True:
+            if len(self.lidar_queue) == 0:
+                self.get_logger().info('lidar_msg not received')
+                self.warning_index += 1
+                if self.warning_index >=10:
+                    raise Ros2MsgError("lidar_msg not received more than 10 times")
                 return
+            msg_lidar = self.lidar_queue[0]
+            comp = compare_ts(msg_emb.header.stamp, msg_lidar.header.stamp)
+            comp = comp / 1e9
+            if abs(comp)<0.15:
+                self.get_logger().info('found lidar_msg')
+                break
+            elif comp < -0.15:
+                self.get_logger().info('lidar_msg too late')
+                return
+            else:
+                self.lidar_queue.popleft()
+        if msg_lidar.size == 0:
+            return
         start_t=time.time()
         points = np.zeros([msg_lidar.size, 6], dtype=np.float32)
         img_data = self.bridge.compressed_imgmsg_to_cv2(msg_emb.image, 'bgr8')
@@ -210,7 +214,19 @@ class SAMObstacleNode(Node):
             if i not in used_lidar_indexes:
                 removed_lidar_boxes.append(lidar_box)
                 removed_coords.append(coord)
-        yolov8_boxes = msg_emb.data
+        # yolov8_boxes = msg_emb.data
+        yolov8_boxes = []
+        while len(self.yolo_queue) > 0:
+            msg_yolo = self.yolo_queue[0]
+            comp = compare_ts(msg_emb.header.stamp, msg_yolo.header.stamp)
+            comp = comp / 1e9
+            if comp < -0.1:
+                break
+            elif abs(comp) <= 0.1:
+                yolov8_boxes = msg_yolo.data
+                break
+            else:
+                self.yolo_queue.popleft()
         n_classes = len(coords)
         for y_box in yolov8_boxes:
             # y_box.x = y_box.x - 0.5 * y_box.w
@@ -238,6 +254,7 @@ class SAMObstacleNode(Node):
                 if max_iou > self.iou_thres:
                     new_added_result['segmentation'] = None
                 res.append(new_added_result)
+        infer_t=time.time()
         
         boxls = []
         myboxs = []
@@ -263,6 +280,7 @@ class SAMObstacleNode(Node):
                 
                 boxls.append(bx)
                 myboxs.append([bbx[0], bbx[1], bbx[0] + bbx[2], bbx[1] + bbx[3]])
+
         pointls = []
         if ori_coords != []:
             point_cloud = o3d.geometry.PointCloud()
@@ -302,7 +320,6 @@ class SAMObstacleNode(Node):
 
                 xmin, ymin, xmax, ymax = np.min(cod[:,0]), np.min(cod[:,1]), np.max(cod[:,0]), np.max(cod[:,1])
 
-
                 if len(myboxs) == 0:
                     myboxs.append([xmin, ymin, xmax, ymax])
                     nbx = OneBox()
@@ -323,6 +340,7 @@ class SAMObstacleNode(Node):
                     nbx.x1, nbx.y1, nbx.x2, nbx.y2 = float(xmin), float(ymin), float(xmax), float(ymax)
                     boxls.append(nbx)
                     myboxs.append([xmin, ymin, xmax, ymax])
+                
 
         # spoints.coords = [cod.tolist() for cod in coords]
         # spoints.ojblidars = [obl.tolist() for obl in objlidars]
@@ -343,21 +361,41 @@ class SAMObstacleNode(Node):
         samres.image = msg_emb.image
         samres.header.stamp.sec = msg_emb.header.stamp.sec
         samres.header.stamp.nanosec = msg_emb.header.stamp.nanosec
-        self.sam_obstacle_pub.publish(samres)
-        infer_utils.show_lidar_result(img_data, coords=coords, res=res, show_mask=True, video_writer=self.vw)
+        # self.sam_obstacle_pub.publish(samres)
+        img_data = infer_utils.show_lidar_result(img_data, coords=coords, res=res, show_mask=False, video_writer=self.vw)
+        if len(res) > 0 and self.saveimg:
+            cv2.imwrite('result_imgs/obstacle_%s.jpg'%(str(self.result_index).rjust(4, '0')), img_data)
+            self.result_index += 1
         fps=1/(time.time()-start_t)
-        print("fps: %2.3f"%fps)
-        self.hang = False
+        infer_fps=1/(infer_t-start_t)
+        print("fps: %2.3f, infer_fps: %2.3f" % (fps, infer_fps))
 
-    async def lidar_callback(self, lidar_msg):
+    def lidar_callback(self, lidar_msg):
         self.warning_index = 0
-        with self.lock:
-            print("lidar ts: %d, lidar_queue_size: %d"%(lidar_msg.header.stamp.sec, len(self.lidar_queue)))
-            if len(self.lidar_queue) > 0 and self.lidar_queue[-1].header.stamp.sec > lidar_msg.header.stamp.sec:
-                self.lidar_queue = deque()
-            self.lidar_queue.append(lidar_msg)
-            if len(self.lidar_queue) > self.max_queue_size:
-                self.lidar_queue.popleft()
+        print("lidar ts: %d, lidar_queue_size: %d"%(lidar_msg.header.stamp.sec, len(self.lidar_queue)))
+        if len(self.lidar_queue) > 0 and self.lidar_queue[-1].header.stamp.sec > lidar_msg.header.stamp.sec:
+            self.lidar_queue = deque()
+        self.lidar_queue.append(lidar_msg)
+        if len(self.lidar_queue) > self.max_queue_size:
+            self.lidar_queue.popleft()
+            
+    def yolo_callback(self, yolo_msg):
+        print("yolo ts: %d, yolo_queue_size: %d"%(yolo_msg.header.stamp.sec, len(self.yolo_queue)))
+        if len(self.yolo_queue) > 0 and self.yolo_queue[-1].header.stamp.sec > yolo_msg.header.stamp.sec:
+            self.yolo_queue = deque()
+        self.yolo_queue.append(yolo_msg)
+        if len(self.yolo_queue) > self.yolo_queue_size:
+            self.yolo_queue.popleft()
+
+    def task_callback(self, task_msg):
+        print(task_msg.pose.position.z)
+        if int(task_msg.pose.position.z) == 14:
+            ModelSingleton.release()
+        elif int(task_msg.pose.position.z) in (6,7,10,11):
+            self.saveimg = True
+        else:
+            self.mask_decoder_model = ModelSingleton()
+            self.saveimg = False
 
 def try_spin(node):
     try:
@@ -378,3 +416,4 @@ def main(args=None):
     minimal_subscriber = SAMObstacleNode('SAMObstacle')
     # 运行节点
     try_spin(minimal_subscriber)
+

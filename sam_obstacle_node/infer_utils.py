@@ -1,7 +1,7 @@
 import torch
 import numpy as np
 import sys
-sys.path.append("/home/gywrc-s1/xfy/xufengyu_BasePerception_0720_sam/src/SAM_seg_head_node/segment_anything_yhl/")
+sys.path.append("src/SAM_seg_head_node")
 from segment_anything_yhl.utils.amg import batch_iterator, MaskData, calculate_stability_score, batched_mask_to_box, box_xyxy_to_xywh
 from segment_anything_yhl.utils.transforms import ResizeLongestSide
 from segment_anything_yhl.utils.onnx import SamOnnxModel
@@ -13,33 +13,33 @@ random_colors = [[random.randint(0,255) for _ in range(3)] for _ in range(100)]
 
 def show_lidar_result(img, coords, res, show_mask=False, video_writer=None):
     import cv2, random, sys
-    cv2.namedWindow("test", 0)
-    cv2.resizeWindow("test", 1000, 600)
+    #cv2.namedWindow("obstacle", 0)
+    #cv2.resizeWindow("obstacle", 800, 480)
     if coords is not None:
         for i, coord in enumerate(coords):
             color = [255,0,0]
-            # color = random_colors[i]
             for pixel in coord:
                 pixel = pixel.astype('int32')
-                img = cv2.circle(img, pixel, 3, color, 3)
+                img = cv2.circle(img, pixel, 2, color, 2)
     for i in range(len(res)):
         color = random_colors[i]
         bbox=[int(x) for x in res[i]['bbox']]
-        x, y, w, h = bbox
-        img = cv2.rectangle(img, [x, y], [x+w, y+h], color, 2)
+        x, y, w, h = bbox[:4]
+        obj_class = 0
+        if len(bbox) == 5:
+            obj_class = bbox[4]+1
+        img = cv2.rectangle(img, [x, y], [x+w, y+h], color, 4)
+        text = ['unknown', 'armored_car', 'smog', 'person', 'car', 'cones', 'barrel']
+        img = cv2.putText(img, text[obj_class], [x, y+h+12], cv2.FONT_HERSHEY_SIMPLEX, 1, [0,0,0], 4)
         if show_mask:
             mask=res[i]['segmentation']
             if mask is not None:
                 img[mask]=color
-    cv2.imshow("test", img)
+    cv2.imshow("obstacle", cv2.resize(img, (600, 360)))
     if video_writer:
         video_writer.write(img)
-    waitKey = cv2.waitKey(25)
-    if waitKey & 0xFF == ord('q'):
-        cv2.destroyAllWindows()
-        if video_writer:
-            video_writer.release()
-        sys.exit(0)
+    cv2.waitKey(1)
+    return img
 
 def resample_coords(coords, max_point, n_resample):
     import random
