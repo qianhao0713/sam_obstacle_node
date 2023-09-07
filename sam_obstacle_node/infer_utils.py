@@ -13,29 +13,35 @@ random_colors = [[random.randint(0,255) for _ in range(3)] for _ in range(100)]
 
 def show_lidar_result(img, coords, res, show_mask=False, video_writer=None):
     import cv2, random, sys
-    #cv2.namedWindow("obstacle", 0)
-    #cv2.resizeWindow("obstacle", 800, 480)
+    img = cv2.resize(img, [1920, 1080])
     if coords is not None:
         for i, coord in enumerate(coords):
             color = [255,0,0]
+            # color = random_colors[i]
             for pixel in coord:
                 pixel = pixel.astype('int32')
                 img = cv2.circle(img, pixel, 2, color, 2)
     for i in range(len(res)):
         color = random_colors[i]
+        if 'bbox' not in res[i]:
+            continue
         bbox=[int(x) for x in res[i]['bbox']]
         x, y, w, h = bbox[:4]
         obj_class = 0
         if len(bbox) == 5:
             obj_class = bbox[4]+1
-        img = cv2.rectangle(img, [x, y], [x+w, y+h], color, 4)
-        text = ['unknown', 'armored_car', 'smog', 'person', 'car', 'cones', 'barrel']
-        img = cv2.putText(img, text[obj_class], [x, y+h+12], cv2.FONT_HERSHEY_SIMPLEX, 1, [0,0,0], 4)
+        # img = cv2.rectangle(img, [x, y], [x+w, y+h], color, 4)
+        img = cv2.rectangle(img, [x, y], [x+w, y+h], [0,0,255], 4)
+        cls = ['unknown', 'armored_car', 'smog', 'person', 'car', 'cones', 'barrel']
+        img = cv2.putText(img, cls[obj_class], [x, y+h+12], cv2.FONT_HERSHEY_SIMPLEX, 1, [255,255,255], 2)
+        if 'blh' in res[i]:
+            blh = res[i]['blh']
+            img = cv2.putText(img, blh, [x, y+h+48], cv2.FONT_HERSHEY_SIMPLEX, 1, [255,255,255], 2)
         if show_mask:
             mask=res[i]['segmentation']
             if mask is not None:
                 img[mask]=color
-    cv2.imshow("obstacle", cv2.resize(img, (600, 360)))
+    cv2.imshow("obstacle", cv2.resize(img, [640, 360]))
     if video_writer:
         video_writer.write(img)
     cv2.waitKey(1)
@@ -255,3 +261,4 @@ class MaskDecoderUtil():
             }
             res.append(ann)
         return orig_lidar_box, ori_coords, coords, res
+

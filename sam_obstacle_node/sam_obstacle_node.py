@@ -1,4 +1,8 @@
 import sys
+
+# sys.path.append("/home/user/gitcode/auto-pilot_-ros2_-node/2_Perception/xufengyu_BasePerception/xufengyu_BasePerception_0827_sam/src/SAM_seg_head_node")
+# sys.path.append("/home/user/gitcode/auto-pilot_-ros2_-node/2_Perception/xufengyu_BasePerception/xufengyu_BasePerception_0827_sam/src/msgs")
+
 import os
 
 import cv2
@@ -21,6 +25,8 @@ from perception_msgs.msg import PointClusterVec
 from perception_msgs.msg import SamResults, OnePoint, OneBox
 from geometry_msgs.msg import PoseStamped
 from segment_anything.build_ros_model import build_ros_model
+# import pycuda.driver as drv
+# from pointcloud_cluster_cpp.lib import pointcloud_cluster
 from . import infer_utils
 from collections import deque
 from threading import Lock
@@ -29,6 +35,8 @@ from rclpy.callback_groups import ReentrantCallbackGroup, MutuallyExclusiveCallb
 from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy
 import open3d as o3d
 import threading
+from . import CoordinateTransformation
+from scipy.spatial.transform import Rotation as R
 
 class Ros2MsgError(Exception):
     def __init__(self,errorInfo):
@@ -124,7 +132,7 @@ class SAMObstacleNode(Node):
         fcc = cv2.VideoWriter_fourcc(*'XVID')
         # self.vw=cv2.VideoWriter('/home/gywrc-s1/qianhao/workspace/video/hby_obstacle001.avi', fcc, 10.0, (1920, 1080))
         self.vw=None
-        self.iou_thres = 0.6
+        self.iou_thres = 0.2
         self.lidar_queue = deque()
         self.max_queue_size = 20
         self.yolo_queue = deque()
@@ -146,12 +154,13 @@ class SAMObstacleNode(Node):
         self.img_subscription= self.create_subscription(VitImageEmbedding, "/Image_embedding", self.callback, self.qos_profile_img,  callback_group=self.img_callback_group, )
         self.lidar_subscription= self.create_subscription(PointClusterVec, "/sam_point_cluster", self.lidar_callback, self.qos_profile, callback_group=self.lidar_callback_group)
         self.yolo_subscription = self.create_subscription(BoundingBoxes, "/yolov8/bounding_boxes_mask", self.yolo_callback, self.qos_profile, callback_group=self.yolo_callback_group)
-        self.task_num = self.create_subscription(PoseStamped, 'task_num', self.task_callback, self.qos_profile)
+        # self.task_num = self.create_subscription(PoseStamped, 'task_num', self.task_callback, self.qos_profile)
         self.sam_obstacle_pub = self.create_publisher(SamResults, "/sam_obstacle", 1)
         self.hang = False
         self.warning_index = 0
         self.result_index = 0
-        self.saveimg = False
+        self.saveimg = 0
+        self.co_trans = CoordinateTransformation.CoordinateTransformation()
         print('init done')
         
         # self.lidar_queue_size = 30
@@ -172,7 +181,6 @@ class SAMObstacleNode(Node):
             comp = compare_ts(msg_emb.header.stamp, msg_lidar.header.stamp)
             comp = comp / 1e9
             if abs(comp)<0.15:
-                self.get_logger().info('found lidar_msg')
                 break
             elif comp < -0.15:
                 self.get_logger().info('lidar_msg too late')
@@ -184,15 +192,41 @@ class SAMObstacleNode(Node):
         start_t=time.time()
         points = np.zeros([msg_lidar.size, 6], dtype=np.float32)
         img_data = self.bridge.compressed_imgmsg_to_cv2(msg_emb.image, 'bgr8')
+        
+        pose_x = msg_emb.pose_x
+        pose_y = msg_emb.pose_y
+        pose_z = msg_emb.pose_z
+        orientation_x = msg_emb.orientation_x
+        orientation_y = msg_emb.orientation_y
+        orientation_z = msg_emb.orientation_z
+        orientation_w = msg_emb.orientation_w
+        task_num = msg_emb.task_num
+        if int(task_num) == 14:
+            ModelSingleton.release()
+        elif int(task_num) in (6,7,10,11):
+            self.mask_decoder_model = ModelSingleton()
+            self.saveimg += 1
+        else:
+            self.mask_decoder_model = ModelSingleton()
+            self.saveimg = 0
+
+        q = np.array([orientation_x, orientation_y, orientation_z, orientation_w])
+        pos_car = np.array([pose_x, pose_y, pose_z])
+        C = R.from_quat(q).as_matrix()
+        
         for i, lidar_single_msg in enumerate(msg_lidar.vec):
             points[i, 0] = lidar_single_msg.x
             points[i, 1] = lidar_single_msg.y
             points[i, 2] = lidar_single_msg.z
             points[i, 5] = lidar_single_msg.label
+        start_t1=time.time()
         lidar_boxes, ori_coords, coords, res = self.mask_decoder_model.infer(image_embedding, points)
+        lidar_boxes[:, 2] = lidar_boxes[:, 2] - lidar_boxes[:, 0]
+        lidar_boxes[:, 3] = lidar_boxes[:, 3] - lidar_boxes[:, 1]
+        infer_t1 = time.time()
         removed_lidar_boxes = []
-        removed_coords = []
-        used_lidar_indexes = set()
+        # removed_coords = []
+        # used_lidar_indexes = set()
         max_iou_dicts = {}
         for i, single_res in enumerate(res):
             cluster_label = single_res['cluster_label'][0]
@@ -203,17 +237,32 @@ class SAMObstacleNode(Node):
                 if iou_preds > max_iou_dicts[cluster_label][0]:
                     max_iou_dicts[cluster_label]=(iou_preds, i)
         res2 = []
-        for k, v in max_iou_dicts.items():
-            res2.append(res[v[1]])
+        # for k, v in max_iou_dicts.items():
+        #     single_res = res[v[1]]
+        #     single_res['points'] = ori_coords[k]
+        #     res2.append(single_res)
+        for i in range(len(coords)):
+            if i in max_iou_dicts.keys():
+                single_res = res[max_iou_dicts[i][1]]
+                single_res['points'] = ori_coords[i]
+                single_res['coords'] = coords[i]
+                res2.append(single_res)
+            else:
+                single_res = {}
+                single_res['points'] = ori_coords[i]
+                single_res['coords'] = coords[i]
+                single_res['lidar_box'] = lidar_boxes[i]
+                single_res['cluster_label'] = [i]
+                res2.append(single_res)
         res = res2
-        for single_res in res:
-            used_lidar_indexes.add(single_res["cluster_label"][0])
-        for i in range(len(lidar_boxes)):
-            lidar_box = lidar_boxes[i]
-            coord = coords[i]
-            if i not in used_lidar_indexes:
-                removed_lidar_boxes.append(lidar_box)
-                removed_coords.append(coord)
+        # for single_res in res:
+        #     used_lidar_indexes.add(single_res["cluster_label"][0])
+        # for i in range(len(lidar_boxes)):
+        #     lidar_box = lidar_boxes[i]
+        #     coord = coords[i]
+        #     if i not in used_lidar_indexes:
+        #         removed_lidar_boxes.append(lidar_box)
+                # removed_coords.append(coord)
         # yolov8_boxes = msg_emb.data
         yolov8_boxes = []
         while len(self.yolo_queue) > 0:
@@ -227,7 +276,7 @@ class SAMObstacleNode(Node):
                 break
             else:
                 self.yolo_queue.popleft()
-        n_classes = len(coords)
+        # n_classes = len(coords)
         for y_box in yolov8_boxes:
             # y_box.x = y_box.x - 0.5 * y_box.w
             # y_box.y = y_box.y - 0.5 * y_box.h
@@ -235,7 +284,10 @@ class SAMObstacleNode(Node):
             max_iou = 0
             box_index = -1
             for i, single_res in enumerate(res):
-                bbox = single_res['bbox']
+                if 'bbox' in single_res:
+                    bbox = single_res['bbox']
+                elif 'lidar_box' in single_res:
+                    bbox = single_res['lidar_box']
                 iou = calc_iou(yolo_bbox[:4], bbox[:4])
                 if iou > max_iou:
                     max_iou = iou
@@ -246,21 +298,17 @@ class SAMObstacleNode(Node):
                 new_added_result = {}
                 new_added_result['bbox'] = yolo_bbox
                 new_added_result['segmentation'] = None
-                for i, removed_lidar_box in enumerate(removed_lidar_boxes):
-                    iou = calc_iou(yolo_bbox[:4], removed_lidar_box[:4])
-                    if iou > max_iou:
-                        max_iou = iou
-                        box_index = i
-                if max_iou > self.iou_thres:
-                    new_added_result['segmentation'] = None
                 res.append(new_added_result)
-        infer_t=time.time()
+
         
         boxls = []
         myboxs = []
+        pointls = []
+        point_cloud = o3d.geometry.PointCloud()
         if res != []:
             for ans in res:
-
+                if 'bbox' not in ans:
+                    continue
                 bx = OneBox()
 
                 bx.cid = 0
@@ -280,11 +328,12 @@ class SAMObstacleNode(Node):
                 
                 boxls.append(bx)
                 myboxs.append([bbx[0], bbx[1], bbx[0] + bbx[2], bbx[1] + bbx[3]])
-
-        pointls = []
-        if ori_coords != []:
-            point_cloud = o3d.geometry.PointCloud()
-            for ol, cod in zip(ori_coords, coords):
+                
+                if 'points' not in ans:
+                    continue
+                ol = ans['points']
+                cod = ans['coords']
+                
                 point_cloud.points = o3d.utility.Vector3dVector(ol)
                 axis_aligned_box = point_cloud.get_axis_aligned_bounding_box()
                 mincords, maxcords = axis_aligned_box.get_min_bound(), axis_aligned_box.get_max_bound()
@@ -317,43 +366,12 @@ class SAMObstacleNode(Node):
                 pt.distance = nowdist
 
                 pointls.append(pt)
-
-                xmin, ymin, xmax, ymax = np.min(cod[:,0]), np.min(cod[:,1]), np.max(cod[:,0]), np.max(cod[:,1])
-
-                if len(myboxs) == 0:
-                    myboxs.append([xmin, ymin, xmax, ymax])
-                    nbx = OneBox()
-                    nbx.x1, nbx.y1, nbx.x2, nbx.y2 = float(xmin), float(ymin), float(xmax), float(ymax)
-                    boxls.append(nbx)
-                    continue
-
-                if len(myboxs) == 1:
-                    iounp = cal_iou(np.array([xmin, ymin, xmax, ymax]), np.array(myboxs).reshape((1, 4)))
-                else:
-                    iounp = cal_iou(np.array([xmin, ymin, xmax, ymax]), np.array(myboxs))
-
-                ioumax = np.amax(iounp)
-                ioumax_idx = np.argmax(iounp)
-
-                if ioumax < 0.2:
-                    nbx = OneBox()
-                    nbx.x1, nbx.y1, nbx.x2, nbx.y2 = float(xmin), float(ymin), float(xmax), float(ymax)
-                    boxls.append(nbx)
-                    myboxs.append([xmin, ymin, xmax, ymax])
                 
+                pos_obj = pos_car + C.dot(np.array([-pt.y3d, pt.x3d+1.15, pt.z3d]))
+                BLH_res = self.co_trans.NEU2BLH(pos_obj)
+                ans['blh'] = "%3.7f, %3.7f" % (BLH_res[0], BLH_res[1])
 
-        # spoints.coords = [cod.tolist() for cod in coords]
-        # spoints.ojblidars = [obl.tolist() for obl in objlidars]
-
-        # sboxs = SamBoxs()
-        # spoints = SamPoints()
-
-        # sboxs.boxes = boxls
-        # spoints.points = pointls
-
-        # self.publish_samboxs.publish(sboxs)
-        # self.publish_sampoints.publish(spoints)
-
+        infer_t=time.time()
 
         samres = SamResults()
         samres.boxes = boxls
@@ -361,14 +379,17 @@ class SAMObstacleNode(Node):
         samres.image = msg_emb.image
         samres.header.stamp.sec = msg_emb.header.stamp.sec
         samres.header.stamp.nanosec = msg_emb.header.stamp.nanosec
-        # self.sam_obstacle_pub.publish(samres)
-        img_data = infer_utils.show_lidar_result(img_data, coords=coords, res=res, show_mask=False, video_writer=self.vw)
-        if len(res) > 0 and self.saveimg:
+        self.sam_obstacle_pub.publish(samres)
+        # img_data = infer_utils.show_lidar_result(img_data, coords=coords, res=res, show_mask=False, video_writer=self.vw)
+        img_data = infer_utils.show_lidar_result(img_data, coords=None, res=res, show_mask=False, video_writer=self.vw)
+        if len(res) > 0 and self.saveimg > 2 and len(yolov8_boxes) > 0:
             cv2.imwrite('result_imgs/obstacle_%s.jpg'%(str(self.result_index).rjust(4, '0')), img_data)
             self.result_index += 1
+            self.saveimg = 0
         fps=1/(time.time()-start_t)
         infer_fps=1/(infer_t-start_t)
-        print("fps: %2.3f, infer_fps: %2.3f" % (fps, infer_fps))
+        infer1_fps=1/(infer_t1-start_t1)
+        print("fps: %2.3f, infer_fps: %2.3f, infer1_fps: %2.3f" % (fps, infer_fps, infer1_fps))
 
     def lidar_callback(self, lidar_msg):
         self.warning_index = 0
@@ -378,7 +399,7 @@ class SAMObstacleNode(Node):
         self.lidar_queue.append(lidar_msg)
         if len(self.lidar_queue) > self.max_queue_size:
             self.lidar_queue.popleft()
-            
+
     def yolo_callback(self, yolo_msg):
         print("yolo ts: %d, yolo_queue_size: %d"%(yolo_msg.header.stamp.sec, len(self.yolo_queue)))
         if len(self.yolo_queue) > 0 and self.yolo_queue[-1].header.stamp.sec > yolo_msg.header.stamp.sec:
@@ -386,16 +407,6 @@ class SAMObstacleNode(Node):
         self.yolo_queue.append(yolo_msg)
         if len(self.yolo_queue) > self.yolo_queue_size:
             self.yolo_queue.popleft()
-
-    def task_callback(self, task_msg):
-        print(task_msg.pose.position.z)
-        if int(task_msg.pose.position.z) == 14:
-            ModelSingleton.release()
-        elif int(task_msg.pose.position.z) in (6,7,10,11):
-            self.saveimg = True
-        else:
-            self.mask_decoder_model = ModelSingleton()
-            self.saveimg = False
 
 def try_spin(node):
     try:
